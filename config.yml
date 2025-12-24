@@ -1,0 +1,12 @@
+# Scan defaults
+scan:
+  dict_path: "dict/dict.txt"
+  thread_num: 10
+  filter_codes: [404, 500, 503, 301, 302, 307, 308]
+  timeout: 5
+
+# Output defaults
+output:
+  report_dir: "report" 
+  file_suffix: "txt" # txt, md, json, csv
+
