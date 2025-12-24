@@ -13,13 +13,28 @@ gosearch 是一个用 Go 编写的目录/文件暴力扫描工具，功能对标
 - 配置：`config.yml` 默认字典/线程/过滤/输出后缀；内置小型默认字典、UA 池。
 - CLI：基于 Cobra，常用参数有短选项（`-u/-l/-w/-e/-t/-r/-m/-p/-R/-E/-S/-C/-q/-d/-D/-X` 等）。
 
-## 快速开始
+
+## 构建
 ```bash
+
 # 准备依赖
 go mod download
 
+# Linux/WSL
+./build.sh
+
+# Windows
+.\build.bat
+
+# 或直接
+go build ./...
+```
+
+## 快速开始
+```bash
+
 # 单目标扫描
-gosearch scan -u http://example.com --default-wordlist -e php,asp,aspx -t 50
+gosearch scan -u http://example.com -e php,asp,aspx -t 50
 
 # 批量目标 + 自定义字典
 gosearch scan -l targets.txt -w dict.txt -t 30 --exclude-status 404,500
@@ -45,17 +60,7 @@ gosearch scan -u http://example.com -w dict.txt -o csv
 - 终端输出按 host 分组，并对同 host 下状态码+响应大小的重复结果只显示第一次命中。
 - 报告路径：`report/<host>/_yy-mm-dd_hh-mm-ss.<ext>`，支持 txt/csv/json/md；csv/json 内含过滤后的结果。
 
-## 构建
-```bash
-# Linux/WSL
-./build.sh
 
-# Windows
-.\build.bat
-
-# 或直接
-go build ./...
-```
 Go 版本要求：>= 1.21。
 
 ## 典型使用示例
