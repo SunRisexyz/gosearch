@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"gosearch/internal/output"
-	"gosearch/internal/scanner"
-	"gosearch/internal/utils"
+	"gosearch/core/output"
+	"gosearch/core/scanner"
+	"gosearch/core/utils"
 
 	"github.com/spf13/cobra"
 )

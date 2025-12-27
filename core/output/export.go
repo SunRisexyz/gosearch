@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"gosearch/internal/utils"
+	"gosearch/core/utils"
 )
 
 func WriteResults(path string, results []Result, meta ReportMeta) error {

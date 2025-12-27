@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gosearch/internal/output"
-	"gosearch/internal/utils"
+	"gosearch/core/output"
+	"gosearch/core/utils"
 
 	"golang.org/x/sync/errgroup"
 )

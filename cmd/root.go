@@ -5,8 +5,8 @@ import (
 	"os"
 	"strings"
 
-	"gosearch/internal/output"
-	"gosearch/internal/utils"
+	"gosearch/core/output"
+	"gosearch/core/utils"
 
 	"github.com/spf13/cobra"
 )
