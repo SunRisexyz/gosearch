@@ -56,6 +56,14 @@ gosearch scan -u http://example.com -w dict.txt -o csv
 - 过滤/输出：`--status-codes`、`-E/--exclude-status`、`-S/--exclude-size`、`-C/--exclude-content`、`-q/--quiet`、`-o/--output`
 - 调试：`-D/--debug`（打印请求/响应调试信息）
 
+## 字典初始化
+
+- 使用`.\gosearch.exe scan -u <ip> --default-wordlist`后会在当前路径下生成两个文件夹`report`和`dict`
+- `report`用来存放输出报告
+- `dict`用来存放字典，其中`dict/dict.txt`是默认字典，用户可自行更改其中内容，初始化默认字典
+- 初始化默认字典后，后续扫描无需传入`--defalut-wordlist`参数即可使用默认dict.txt字典
+
+
 ## 报告与去重
 - 终端输出按 host 分组，并对同 host 下状态码+响应大小的重复结果只显示第一次命中。
 - 报告路径：`report/<host>/_yy-mm-dd_hh-mm-ss.<ext>`，支持 txt/csv/json/md；csv/json 内含过滤后的结果。
