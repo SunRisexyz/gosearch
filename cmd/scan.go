@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -61,6 +63,15 @@ var scanCmd = &cobra.Command{
 		if scanOpts.TimeoutSec < 0 {
 			return errors.New("timeout must be >= 0")
 		}
+		if scanOpts.ConnectTimeoutSec < 0 {
+			return errors.New("connect-timeout must be >= 0")
+		}
+		if scanOpts.ResponseHeaderTimeoutSec < 0 {
+			return errors.New("response-header-timeout must be >= 0")
+		}
+		if scanOpts.MaxBodyBytes < 0 {
+			return errors.New("max-body-bytes must be >= 0")
+		}
 		if scanOpts.MaxDepth < 1 {
 			scanOpts.MaxDepth = 3
 		}
@@ -105,6 +116,15 @@ var scanCmd = &cobra.Command{
 		scanOpts.StatusFilter, err = utils.ParseStatusSet(scanOpts.StatusFilterRaw)
 		if err != nil {
 			return err
+		}
+		if scanOpts.ResumePath != "" {
+			scanOpts.Resume = true
+		}
+		if scanOpts.Resume {
+			if scanOpts.ResumePath == "" {
+				scanOpts.ResumePath = defaultResumePath(cfg.Output.ReportDir, targets, wordlistPath, scanOpts)
+			}
+			output.PrintInfo(fmt.Sprintf("resume state: %s", scanOpts.ResumePath))
 		}
 
 		outputPathPreview := scanOpts.OutputPath
@@ -200,8 +220,38 @@ func init() {
 
 	scanCmd.Flags().StringVarP(&scanOpts.Method, "method", "X", "GET", "HTTP method")
 	scanCmd.Flags().IntVarP(&scanOpts.TimeoutSec, "timeout", "T", 0, "Request timeout in seconds")
+	scanCmd.Flags().IntVar(&scanOpts.ConnectTimeoutSec, "connect-timeout", 0, "TCP/TLS connect timeout in seconds (0 = request timeout)")
+	scanCmd.Flags().IntVar(&scanOpts.ResponseHeaderTimeoutSec, "response-header-timeout", 0, "Response header timeout in seconds (0 = disabled)")
+	scanCmd.Flags().IntVar(&scanOpts.MaxBodyBytes, "max-body-bytes", 0, "Maximum response body bytes to read per request (0 = unlimited)")
+	scanCmd.Flags().BoolVar(&scanOpts.NoProxyFallback, "no-proxy-fallback", false, "Disable fallback to direct connection when proxy fails")
+	scanCmd.Flags().BoolVar(&scanOpts.Resume, "resume", false, "Resume scan by skipping URLs stored in the resume state file")
+	scanCmd.Flags().StringVar(&scanOpts.ResumePath, "resume-file", "", "Resume state file path (implies --resume)")
 
 	scanCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
 		fmt.Println(strings.TrimSpace(cmd.UsageString()))
 	})
+}
+
+func defaultResumePath(reportDir string, targets []string, wordlistPath string, opts scanner.Options) string {
+	if reportDir == "" {
+		reportDir = "."
+	}
+	host := "scan"
+	if len(targets) > 0 {
+		if parsedHost, err := utils.HostFromURL(targets[0]); err == nil {
+			host = utils.SafeFilename(parsedHost)
+		}
+	}
+	fingerprint := strings.Join([]string{
+		strings.Join(targets, "\n"),
+		wordlistPath,
+		opts.Extensions,
+		opts.Method,
+		fmt.Sprintf("recursive=%t", opts.Recursive),
+		fmt.Sprintf("max-depth=%d", opts.MaxDepth),
+		fmt.Sprintf("fuzz=%t", opts.FuzzEnabled),
+		opts.FuzzDictPath,
+	}, "|")
+	sum := sha1.Sum([]byte(fingerprint))
+	return filepath.Join(reportDir, "resume", fmt.Sprintf("%s_%s.jsonl", host, hex.EncodeToString(sum[:])[:12]))
 }

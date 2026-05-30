@@ -31,32 +31,70 @@ type task struct {
 	seq     uint64
 }
 
+type taskScheduler struct {
+	paths      []string
+	opts       Options
+	wg         *sync.WaitGroup
+	ch         chan<- task
+	visited    map[string]struct{}
+	visitedMu  *sync.Mutex
+	seqCounter *uint64
+	total      *uint64
+	scanned    *uint64
+	resume     *resumeStore
+}
+
 func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
+	if opts.Threads < 1 {
+		opts.Threads = 1
+	}
 	if opts.MaxProcs > 0 {
 		runtime.GOMAXPROCS(opts.MaxProcs)
 	}
 
 	output.ResetFilters()
 
+	var resume *resumeStore
+	var err error
+	if opts.Resume {
+		resume, err = openResumeStore(opts.ResumePath)
+		if err != nil {
+			return nil, Stats{}, err
+		}
+		defer resume.close()
+	}
+
+	bases := make([]string, 0, len(targets))
+	for _, target := range targets {
+		base, err := normalizeBase(target)
+		if err != nil {
+			return nil, Stats{}, err
+		}
+		bases = append(bases, base)
+	}
+
 	client, err := buildClient(opts)
 	if err != nil {
 		return nil, Stats{}, err
 	}
-	directOpts := opts
-	directOpts.Proxy = ""
-	directOpts.Socks5 = ""
-	directOpts.ProxyAuth = ""
-	directClient, err := buildClient(directOpts)
-	if err != nil {
-		return nil, Stats{}, err
+	var directClient *http.Client
+	if (opts.Proxy != "" || opts.Socks5 != "") && !opts.NoProxyFallback {
+		directOpts := opts
+		directOpts.Proxy = ""
+		directOpts.Socks5 = ""
+		directOpts.ProxyAuth = ""
+		directClient, err = buildClient(directOpts)
+		if err != nil {
+			return nil, Stats{}, err
+		}
 	}
 
 	paths := buildPaths(opts.Words, opts.Extensions, opts.FuzzEnabled, opts.FuzzWords)
 
-	workCh := make(chan task, opts.Threads*2)
+	workCh := make(chan task, queueBufferSize(opts.Threads))
 	var taskWG sync.WaitGroup
 
-	var total uint64 = uint64(len(paths) * len(targets))
+	var total uint64
 	var scanned uint64
 	var hits uint64
 
@@ -64,11 +102,23 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 	var resultsMu sync.Mutex
 	var seqCounter uint64
 	statusSizeMu := &sync.Mutex{}
-	statusSizeFirst := make(map[int]map[int]uint64)
+	statusSizeFirst := make(map[string]map[int]map[int]uint64)
+	if resume != nil {
+		for _, res := range resume.previousResults() {
+			if isExcluded(res, opts) {
+				continue
+			}
+			if !shouldDisplay(statusSizeMu, statusSizeFirst, res.Host, res.StatusCode, res.ResponseSize, 0) {
+				continue
+			}
+			results = append(results, res)
+		}
+		hits = uint64(len(results))
+	}
 	var resultCh chan output.Result
 	var resultWG sync.WaitGroup
 	if !opts.Quiet {
-		resultCh = make(chan output.Result, opts.Threads*2)
+		resultCh = make(chan output.Result, queueBufferSize(opts.Threads))
 		resultWG.Add(1)
 		go func() {
 			defer resultWG.Done()
@@ -80,6 +130,18 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 
 	visited := make(map[string]struct{})
 	var visitedMu sync.Mutex
+	scheduler := &taskScheduler{
+		paths:      paths,
+		opts:       opts,
+		wg:         &taskWG,
+		ch:         workCh,
+		visited:    visited,
+		visitedMu:  &visitedMu,
+		seqCounter: &seqCounter,
+		total:      &total,
+		scanned:    &scanned,
+		resume:     resume,
+	}
 
 	ctx := context.Background()
 	group, ctx := errgroup.WithContext(ctx)
@@ -90,33 +152,40 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 	for i := 0; i < opts.Threads; i++ {
 		group.Go(func() error {
 			for t := range workCh {
-				atomic.AddUint64(&scanned, 1)
-				currentPath.Store(t.url)
-				res, ok := doRequest(ctx, client, directClient, t.url, opts)
-				if ok {
-					if !isExcluded(res, opts) {
-						if !shouldDisplay(statusSizeMu, statusSizeFirst, res.StatusCode, res.ResponseSize, t.seq) {
-							taskWG.Done()
-							continue
+				func() {
+					defer taskWG.Done()
+
+					atomic.AddUint64(&scanned, 1)
+					currentPath.Store(t.url)
+					res, ok := doRequest(ctx, client, directClient, t.url, opts)
+					var displayed *output.Result
+					if !ok || isExcluded(res, opts) {
+						if resume != nil {
+							resume.recordDone(t, nil)
 						}
-						resultsMu.Lock()
-						results = append(results, res)
-						resultsMu.Unlock()
-						atomic.AddUint64(&hits, 1)
-						if resultCh != nil {
-							select {
-							case resultCh <- res:
-							default:
-								// avoid blocking workers if logger is slower
-								go func(r output.Result) { resultCh <- r }(res)
-							}
-						}
-						if opts.Recursive && t.isDir && t.depth < opts.MaxDepth {
-							enqueueBase(t.url, paths, t.depth+1, opts, &taskWG, workCh, visited, &visitedMu, &seqCounter)
-						}
+						return
 					}
-				}
-				taskWG.Done()
+					if !shouldDisplay(statusSizeMu, statusSizeFirst, res.Host, res.StatusCode, res.ResponseSize, t.seq) {
+						if resume != nil {
+							resume.recordDone(t, nil)
+						}
+						return
+					}
+					resultsMu.Lock()
+					results = append(results, res)
+					resultsMu.Unlock()
+					displayed = &res
+					atomic.AddUint64(&hits, 1)
+					if resultCh != nil {
+						resultCh <- res
+					}
+					if opts.Recursive && t.isDir && t.depth < opts.MaxDepth {
+						scheduler.enqueueBaseAsync(t.url, t.depth+1)
+					}
+					if resume != nil {
+						resume.recordDone(t, displayed)
+					}
+				}()
 			}
 			return nil
 		})
@@ -127,12 +196,8 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 		go output.PrintProgress(&scanned, &total, &hits, opts.Threads, currentPath, progressDone)
 	}
 
-	for _, target := range targets {
-		base, err := normalizeBase(target)
-		if err != nil {
-			return nil, Stats{}, err
-		}
-		enqueueBase(base, paths, 1, opts, &taskWG, workCh, visited, &visitedMu, &seqCounter)
+	for _, base := range bases {
+		scheduler.enqueueBase(base, 1)
 	}
 
 	go func() {
@@ -146,11 +211,18 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 	if err := group.Wait(); err != nil {
 		return nil, Stats{}, err
 	}
+	if resume != nil {
+		if err := resume.recordErr(); err != nil {
+			return nil, Stats{}, err
+		}
+	}
 	if resultCh != nil {
 		resultWG.Wait()
 	}
 
-	close(progressDone)
+	if !opts.Quiet {
+		close(progressDone)
+	}
 
 	if !opts.Quiet {
 		output.PrintSummary(scanned, total, hits)
@@ -163,37 +235,68 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 	}, nil
 }
 
-func enqueueBase(base string, paths []string, depth int, opts Options, wg *sync.WaitGroup, ch chan<- task, visited map[string]struct{}, visitedMu *sync.Mutex, seqCounter *uint64) {
-	visitedMu.Lock()
-	if _, ok := visited[base]; ok {
-		visitedMu.Unlock()
+func (s *taskScheduler) enqueueBaseAsync(base string, depth int) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.enqueueBase(base, depth)
+	}()
+}
+
+func (s *taskScheduler) enqueueBase(base string, depth int) {
+	s.visitedMu.Lock()
+	if _, ok := s.visited[base]; ok {
+		s.visitedMu.Unlock()
 		return
 	}
-	visited[base] = struct{}{}
-	visitedMu.Unlock()
+	s.visited[base] = struct{}{}
+	s.visitedMu.Unlock()
 
-	for _, p := range paths {
+	tasks := make([]task, 0, len(s.paths))
+	for _, p := range s.paths {
 		isDir := !strings.Contains(p, ".") && !strings.HasSuffix(p, "/")
 		pathURL := joinURL(base, p, isDir)
-		wg.Add(1)
-		seq := atomic.AddUint64(seqCounter, 1)
-		ch <- task{url: pathURL, isDir: isDir, baseURL: base, depth: depth, seq: seq}
+		seq := atomic.AddUint64(s.seqCounter, 1)
+		t := task{url: pathURL, isDir: isDir, baseURL: base, depth: depth, seq: seq}
+		atomic.AddUint64(s.total, 1)
+		if s.resume != nil {
+			if info, ok := s.resume.completedInfo(t.url); ok {
+				atomic.AddUint64(s.scanned, 1)
+				if s.opts.Recursive && info.HadResult && t.isDir && t.depth < s.opts.MaxDepth {
+					s.enqueueBaseAsync(t.url, t.depth+1)
+				}
+				continue
+			}
+		}
+		tasks = append(tasks, t)
+	}
+	if len(tasks) == 0 {
+		return
+	}
+	s.wg.Add(len(tasks))
+	for _, t := range tasks {
+		s.ch <- t
 	}
 }
 
-func shouldDisplay(mu *sync.Mutex, seen map[int]map[int]uint64, status int, size int, seq uint64) bool {
+func shouldDisplay(mu *sync.Mutex, seen map[string]map[int]map[int]uint64, host string, status int, size int, seq uint64) bool {
 	mu.Lock()
 	defer mu.Unlock()
-	if seen[status] == nil {
-		seen[status] = make(map[int]uint64)
+	if host == "" {
+		host = "_"
 	}
-	if old, ok := seen[status][size]; ok {
-		// already have a smaller sequence
+	if seen[host] == nil {
+		seen[host] = make(map[int]map[int]uint64)
+	}
+	if seen[host][status] == nil {
+		seen[host][status] = make(map[int]uint64)
+	}
+	if old, ok := seen[host][status][size]; ok {
 		if old <= seq {
 			return false
 		}
 	}
-	seen[status][size] = seq
+	seen[host][status][size] = seq
 	return true
 }
 
@@ -210,24 +313,23 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 			time.Sleep(time.Duration(opts.DelayMs) * time.Millisecond)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, opts.Method, target, nil)
+		req, err := newScanRequest(ctx, target, opts)
 		if err != nil {
 			return output.Result{}, false
 		}
-		ua := opts.UserAgent
-		if ua == "" {
-			ua = utils.RandomUserAgent()
-		}
-		req.Header.Set("User-Agent", ua)
 
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
-			if (opts.Proxy != "" || opts.Socks5 != "") && directClient != nil {
+			if (opts.Proxy != "" || opts.Socks5 != "") && directClient != nil && !opts.NoProxyFallback {
 				if opts.Debug {
 					output.PrintDebug("PROXY", "proxy failed, fallback to direct")
 				}
-				resp, err = directClient.Do(req)
+				directReq, reqErr := newScanRequest(ctx, target, opts)
+				if reqErr != nil {
+					return output.Result{}, false
+				}
+				resp, err = directClient.Do(directReq)
 			}
 		}
 		if err != nil {
@@ -240,7 +342,7 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 			return output.Result{}, false
 		}
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, responseSize := readBody(resp, opts.MaxBodyBytes)
 		resp.Body.Close()
 
 		redirectURL := ""
@@ -256,7 +358,7 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 			URL:            target,
 			Host:           host,
 			StatusCode:     resp.StatusCode,
-			ResponseSize:   len(bodyBytes),
+			ResponseSize:   responseSize,
 			RedirectURL:    redirectURL,
 			ScanTime:       time.Now(),
 			ResponseTimeMs: int(time.Since(start).Milliseconds()),
@@ -273,6 +375,32 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 		return res, true
 	}
 	return output.Result{}, false
+}
+
+func newScanRequest(ctx context.Context, target string, opts Options) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, opts.Method, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	ua := opts.UserAgent
+	if ua == "" {
+		ua = utils.RandomUserAgent()
+	}
+	req.Header.Set("User-Agent", ua)
+	return req, nil
+}
+
+func readBody(resp *http.Response, maxBytes int) ([]byte, int) {
+	var bodyBytes []byte
+	if maxBytes > 0 {
+		bodyBytes, _ = io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+	} else {
+		bodyBytes, _ = io.ReadAll(resp.Body)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength <= int64(maxInt()) {
+		return bodyBytes, int(resp.ContentLength)
+	}
+	return bodyBytes, len(bodyBytes)
 }
 
 func isExcluded(res output.Result, opts Options) bool {
@@ -377,19 +505,55 @@ func containsAny(body string, terms []string) bool {
 	return false
 }
 
+func queueBufferSize(threads int) int {
+	size := threads * 8
+	if size < 64 {
+		return 64
+	}
+	return size
+}
+
+func maxInt() int {
+	return int(^uint(0) >> 1)
+}
+
 func buildClient(opts Options) (*http.Client, error) {
 	timeout := 15 * time.Second
 	if opts.TimeoutSec > 0 {
 		timeout = time.Duration(opts.TimeoutSec) * time.Second
 	}
+	connectTimeout := timeout
+	if opts.ConnectTimeoutSec > 0 {
+		connectTimeout = time.Duration(opts.ConnectTimeoutSec) * time.Second
+	}
+	responseHeaderTimeout := time.Duration(0)
+	if opts.ResponseHeaderTimeoutSec > 0 {
+		responseHeaderTimeout = time.Duration(opts.ResponseHeaderTimeoutSec) * time.Second
+	}
+	idlePerHost := opts.Threads
+	if idlePerHost < 2 {
+		idlePerHost = 2
+	}
+	maxIdle := idlePerHost * 2
+	if maxIdle < 100 {
+		maxIdle = 100
+	}
+	dialer := &net.Dialer{
+		Timeout:   connectTimeout,
+		KeepAlive: 30 * time.Second,
+	}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: timeout,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: opts.Insecure},
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   idlePerHost,
+		MaxConnsPerHost:       opts.Threads,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   connectTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: opts.Insecure},
 	}
 
 	if opts.Proxy != "" {
@@ -405,13 +569,9 @@ func buildClient(opts Options) (*http.Client, error) {
 	}
 
 	if opts.Socks5 != "" {
-		dialer := &socks5Dialer{address: opts.Socks5, auth: opts.ProxyAuth}
+		dialer := &socks5Dialer{address: opts.Socks5, auth: opts.ProxyAuth, timeout: connectTimeout}
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.Dial(network, addr)
-			if err != nil {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			}
-			return conn, nil
+			return dialer.Dial(network, addr)
 		}
 	}
 
@@ -421,8 +581,12 @@ func buildClient(opts Options) (*http.Client, error) {
 	}
 
 	if opts.FollowRedirects {
+		maxRedirects := opts.MaxRedirects
+		if maxRedirects < 1 {
+			maxRedirects = 5
+		}
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if len(via) >= opts.MaxRedirects {
+			if len(via) >= maxRedirects {
 				return http.ErrUseLastResponse
 			}
 			return nil

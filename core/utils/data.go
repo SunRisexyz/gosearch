@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 var DefaultWordlist = []string{
@@ -275,6 +274,5 @@ func ParseCSVStrings(raw string) []string {
 }
 
 func RandomUserAgent() string {
-	rand.Seed(time.Now().UnixNano())
 	return UserAgents[rand.Intn(len(UserAgents))]
 }

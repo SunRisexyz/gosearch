@@ -49,6 +49,12 @@ type Options struct {
 	Method     string
 	TimeoutSec int
 
+	ConnectTimeoutSec        int
+	ResponseHeaderTimeoutSec int
+	MaxBodyBytes             int
+	NoProxyFallback          bool
+	Resume                   bool
+	ResumePath               string
 }
 
 type Stats struct {
