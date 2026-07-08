@@ -1,22 +1,28 @@
 # gosearch
 
-gosearch 是一个用 Go 编写的目录/文件暴力扫描工具，功能对标 dirsearch，并针对高并发、代理、递归、模糊测试、过滤和报告输出做了工程化支持。
+gosearch 是一个用 Go 编写的 Web 目录/文件发现工具，功能对标 dirsearch，并针对高并发、代理、递归、模糊测试、断点续扫、软 404 过滤、指纹识别、风险分级和结构化报告输出做了工程化支持。
+
+它适合用于渗透测试前期信息收集、认证态目录扫描、批量资产探测和敏感路径发现。
 
 ## 特性概览
-- 目录/文件扫描，支持 `-e` 扩展名组合、`--force-extensions` 全量追加。
-- 递归扫描 (`-r --max-depth`) 与模糊占位符 `{dir}` (`--fuzz --fuzz-dict`)。
-- 并发与速率控制：`-t` 线程、`--delay`/`--random-delay`、`--max-procs`。
-- 代理：HTTP `--proxy`、SOCKS5 `--socks5`、`--proxy-auth`，失败自动直连兜底。
-- 请求健壮性：`--retry`、`--follow-redirects --max-redirects`、`--insecure` 跳过证书验证。
-- 过滤与去重：`--status-codes` 仅显示，`--exclude-status/size/content` 过滤，终端/报告按 host+状态码+大小去重，仅输出首个命中。
-- 输出：终端彩色单行进度，结果按 host 分组；报告支持 txt/csv/json/md，路径按 `report/<host>/_yy-mm-dd_hh-mm-ss.ext`。
-- 配置：`config.yml` 默认字典/线程/过滤/输出后缀；内置小型默认字典、UA 池。
-- CLI：基于 Cobra，常用参数有短选项（`-u/-l/-w/-e/-t/-r/-m/-p/-R/-E/-S/-C/-q/-d/-D/-X` 等）。
 
+- 目录/文件扫描：支持自定义字典、扩展名组合、递归扫描和 `{dir}` fuzz 占位符。
+- 高并发扫描：支持线程数、CPU 核心数、固定延迟、随机延迟和自适应限速。
+- 代理支持：HTTP 代理、SOCKS5 代理、代理认证，代理失败可自动直连兜底。
+- 请求上下文：支持自定义 Header、Cookie、headers 文件和 Burp Raw Request 复用。
+- 指纹识别：基于 Header、Title、Body、Path、Favicon Hash 识别 Web 框架、中间件、CMS 和敏感组件。
+- 自适应字典：命中指纹后自动追加技术栈相关高价值路径。
+- 软 404 过滤：通过随机不存在路径建立基线，过滤假 200、统一错误页等误报。
+- 风险分级：按敏感路径、指纹、状态码自动标记风险等级、分数和原因。
+- 路径发现：支持从 `robots.txt` 和 `sitemap.xml` 自动导入路径。
+- 备份变体：命中路径后自动生成 `.bak`、`.old`、`~`、`.zip` 等常见备份文件变体。
+- 多方法探测：命中后可追加 `HEAD`、`OPTIONS` 等方法探测并记录 `Allow` 头。
+- 断点续扫：支持 resume 文件跳过已完成 URL，并保留已命中结果。
+- 报告输出：支持 txt、csv、json、md，结果按 host 分组并按风险优先级排序。
 
 ## 构建
-```bash
 
+```bash
 # 准备依赖
 go mod download
 
@@ -26,72 +32,229 @@ go mod download
 # Windows
 .\build.bat
 
-# 或直接
+# 或直接构建
 go build ./...
 ```
 
-## 快速开始
-```bash
+Go 版本要求：`>= 1.21`。
 
+## 快速开始
+
+```bash
 # 单目标扫描
-gosearch scan -u http://example.com -e php,asp,aspx -t 50
+gosearch scan -u http://example.com -w dict.txt -t 50
 
 # 批量目标 + 自定义字典
 gosearch scan -l targets.txt -w dict.txt -t 30 --exclude-status 404,500
 
+# 扩展名组合
+gosearch scan -u http://example.com -w dict.txt -e php,asp,aspx,html
+
 # 递归 + fuzz
 gosearch scan -u https://example.com -w dict.txt -r --max-depth 3 --fuzz
 
-# 指定输出格式
+# 输出报告
 gosearch scan -u http://example.com -w dict.txt -o result.json
 gosearch scan -u http://example.com -w dict.txt -o csv
 ```
 
+## 实用功能示例
+
+### 指纹识别与风险排序
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --fingerprint --risk-score
+
+# 只保留高危及以上结果
+gosearch scan -u https://example.com -w dict.txt --risk-score --min-risk high
+```
+
+指纹结果会写入报告字段 `fingerprints`，风险信息会写入 `risk_level`、`risk_score`、`risk_reasons` 和 `tags`。
+
+### 指纹联动字典
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --adaptive-wordlist
+```
+
+命中 WordPress、Tomcat、Swagger、Spring Boot Actuator、Jenkins、Grafana、Nacos 等指纹后，会自动追加对应技术栈的高价值路径。
+
+### 软 404 过滤
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --soft-404
+gosearch scan -u https://example.com -w dict.txt --soft-404 --soft-404-samples 3
+```
+
+扫描前会请求随机不存在路径建立基线。若命中结果与基线状态码一致、大小相近、标题一致，则会被判定为软 404 并过滤。
+
+### 自定义 Header 和 Cookie
+
+```bash
+gosearch scan -u https://example.com -w dict.txt \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Forwarded-For: 127.0.0.1" \
+  --cookie "PHPSESSID=abc; token=xyz"
+```
+
+也可以从文件加载请求头：
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --headers-file headers.txt
+```
+
+`headers.txt` 示例：
+
+```http
+Authorization: Bearer <token>
+X-Forwarded-For: 127.0.0.1
+User-Agent: Mozilla/5.0
+```
+
+### Burp Raw Request 复用
+
+```bash
+gosearch scan --raw-request request.txt -w dict.txt --raw-scheme https
+```
+
+Raw Request 会复用 method、Host、Header、Cookie 和 body。若没有传 `-u/-l`，会从 Raw Request 的 Host 自动推导目标。命令行传入的 `-u/-l`、`-X`、`-H`、`--cookie` 优先级更高。
+
+### robots.txt / sitemap.xml 导入
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --discover
+gosearch scan -u https://example.com -w dict.txt --discover --discover-max 500
+```
+
+会自动导入同 host 下的 `Allow`、`Disallow`、`Sitemap` 和 sitemap `<loc>` 路径。发现路径按原样请求，不会被扩展名规则二次改写。
+
+### 备份文件变体
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --backup-variants
+gosearch scan -u https://example.com -w dict.txt --backup-variants --backup-variant-max 20
+```
+
+命中 `config.php` 后会尝试：
+
+```text
+config.php.bak
+config.php.backup
+config.php.old
+config.php~
+config.bak.php
+```
+
+命中目录时会尝试：
+
+```text
+admin.zip
+admin.tar.gz
+admin.7z
+admin.bak
+```
+
+备份变体命中后不会继续生成二级变体，避免无限扩散。
+
+### 自适应限速
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --adaptive-throttle
+gosearch scan -u https://example.com -w dict.txt --adaptive-throttle --throttle-step 200 --throttle-max-delay 5000
+```
+
+遇到 `429`、`502`、`503`、`504` 或请求失败时会动态增加延迟；健康响应会逐步降低延迟。
+
+### 多方法探测
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --probe-methods HEAD,OPTIONS
+```
+
+主扫描命中后，会对同一 URL 追加指定方法探测，并记录状态码、响应大小、耗时、`Allow` 头和跳转地址。
+
+### 断点续扫
+
+```bash
+gosearch scan -u https://example.com -w dict.txt --resume
+gosearch scan -u https://example.com -w dict.txt --resume-file report/resume/example.jsonl
+```
+
+`--resume` 会记录已完成 URL，再次运行时跳过已完成请求，并保留之前已经命中的结果。
+
 ## 主要参数
+
 - 目标与字典：`-u/--url`、`-l/--list`、`-w/--wordlist`、`--default-wordlist`
-- 扫描：`-e/--extensions`、`-F/--fuzz`、`-G/--fuzz-dict`、`-r/--recursive`、`-m/--max-depth`
-- 并发与速率：`-t/--threads`、`-d/--delay`、`--random-delay`、`-P/--max-procs`
-- 代理：`-p/--proxy`、`-5/--socks5`、`-a/--proxy-auth`
-- 请求控制：`-X/--method`、`-T/--timeout`、`-k/--insecure`、`-y/--retry`、`-R/--follow-redirects`、`-M/--max-redirects`
-- 过滤/输出：`--status-codes`、`-E/--exclude-status`、`-S/--exclude-size`、`-C/--exclude-content`、`-q/--quiet`、`-o/--output`
-- 调试：`-D/--debug`（打印请求/响应调试信息）
+- 扫描策略：`-e/--extensions`、`-F/--fuzz`、`-G/--fuzz-dict`、`-r/--recursive`、`--max-depth`
+- 请求上下文：`-H/--header`、`--cookie`、`--headers-file`、`--raw-request`、`--raw-scheme`
+- 请求控制：`-X/--method`、`--probe-methods`、`-T/--timeout`、`--connect-timeout`、`--response-header-timeout`、`--max-body-bytes`
+- 代理：`-p/--proxy`、`-5/--socks5`、`-a/--proxy-auth`、`--no-proxy-fallback`
+- 重试与 TLS：`-y/--retry`、`-R/--follow-redirects`、`-M/--max-redirects`、`-k/--insecure`
+- 过滤：`--status-codes`、`-E/--exclude-status`、`-S/--exclude-size`、`-C/--exclude-content`、`--soft-404`
+- 增强发现：`--fingerprint`、`--fingerprint-rules`、`--adaptive-wordlist`、`--discover`、`--backup-variants`
+- 风险分析：`--risk-score`、`--min-risk`
+- 速率控制：`-t/--threads`、`-d/--delay`、`--random-delay`、`--adaptive-throttle`、`--throttle-step`、`--throttle-max-delay`、`-P/--max-procs`
+- 输出与调试：`-o/--output`、`-q/--quiet`、`-D/--debug`
+
+## 报告与去重
+
+- 终端输出按 host 分组，并对同 host 下状态码 + 响应大小的重复结果只显示第一次命中。
+- 报告路径：`report/<host>/_yy-mm-dd_hh-mm-ss.<ext>`。
+- 支持格式：txt、csv、json、md。
+- JSON 报告包含 `risk_summary`、`top_findings`、`results` 和 `formatted`。
+- 开启风险评分后，报告会按 `critical -> high -> medium -> low -> info` 排序。
+- 开启指纹识别、多方法探测后，报告会包含 `fingerprints` 和 `method_probes`。
 
 ## 字典初始化
 
-- 使用`.\gosearch.exe scan -u <ip> --default-wordlist`后会在当前路径下生成两个文件夹`report`和`dict`
-- `report`用来存放输出报告
-- `dict`用来存放字典，其中`dict/dict.txt`是默认字典，用户可自行更改其中内容，初始化默认字典
-- 初始化默认字典后，后续扫描无需传入`--defalut-wordlist`参数即可使用默认dict.txt字典
+使用默认字典时：
 
+```bash
+gosearch scan -u http://example.com --default-wordlist
+```
 
-## 报告与去重
-- 终端输出按 host 分组，并对同 host 下状态码+响应大小的重复结果只显示第一次命中。
-- 报告路径：`report/<host>/_yy-mm-dd_hh-mm-ss.<ext>`，支持 txt/csv/json/md；csv/json 内含过滤后的结果。
+首次运行会在当前目录初始化：
 
+- `dict/dict.txt`：默认字典，可自行编辑。
+- `report/`：默认报告目录。
 
-Go 版本要求：>= 1.21。
+初始化后，后续扫描可直接使用配置中的默认字典路径。
 
-## 典型使用示例
-1) 单目标 + 扩展名：
+## 典型组合
+
+```bash
+# 认证态扫描 + 指纹 + 风险排序
+gosearch scan -u https://example.com -w dict.txt \
+  -H "Authorization: Bearer <token>" \
+  --fingerprint --risk-score --min-risk medium
 ```
-gosearch scan -u http://127.0.0.1 --default-wordlist -e php,aspx,html -t 50
+
+```bash
+# 实战增强发现
+gosearch scan -u https://example.com -w dict.txt \
+  --discover --soft-404 --backup-variants --adaptive-wordlist
 ```
-2) 批量目标 + 输出 CSV：
-```
-gosearch scan -l targets.txt -w dict.txt -o csv --status-codes 200,301,302,403
-```
-3) 递归 + fuzz：
-```
-gosearch scan -u https://example.com -w dict.txt -r --max-depth 3 --fuzz --random-delay
+
+```bash
+# Burp 请求复用 + 多方法探测 + 自适应限速
+gosearch scan --raw-request request.txt -w dict.txt \
+  --raw-scheme https \
+  --probe-methods HEAD,OPTIONS \
+  --adaptive-throttle
 ```
 
 ## 与 dirsearch 的主要差异
-- 默认启用按 host+状态码+响应大小的去重，只保留首个命中；可通过字典/状态码调整输出。
-- 报告分 host 存储，路径规则固定（不与原版完全一致）。
-- 部分高级特性（例如自动 404 基线、字典自动优化）未实现。
+
+- 更强调 Go 并发扫描、任务恢复和工程化输出。
+- 支持指纹识别、风险分级、Top Findings 和结构化安全报告字段。
+- 支持认证态扫描、Raw Request 复用和复杂请求上下文。
+- 支持 robots/sitemap 路径导入、指纹联动字典和备份文件变体。
+- 支持软 404 基线过滤和自适应限速，更适合真实目标扫描。
 
 ## 调试与排障
-- `--debug` 查看请求/响应、代理降级等详细信息。
-- 代理问题：确认 `--proxy`/`--socks5` 格式正确；如代理失败会自动直连（debug 有提示）。
-- 输出不全：检查 `--status-codes` / `--exclude-*` / 去重规则；响应体包含 `--exclude-content` 关键词会被过滤。
 
+- 使用 `--debug` 查看请求错误、代理降级、软 404 过滤、自适应字典、备份变体和限速变化。
+- 代理问题：确认 `--proxy`、`--socks5`、`--proxy-auth` 格式正确。
+- 输出不全：检查 `--status-codes`、`--exclude-*`、`--soft-404`、`--min-risk` 和去重规则。
+- Raw Request 失败：确认请求中存在 `Host` 头；相对路径请求需要设置 `--raw-scheme http|https`。
+- 软 404 误过滤：可调大/调小 `--soft-404-size-tolerance`，或暂时关闭 `--soft-404`。

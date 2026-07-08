@@ -64,6 +64,21 @@ func PrintResult(res Result) {
 	fmt.Fprint(os.Stdout, clearLine)
 	status := fmt.Sprintf("%d", res.StatusCode)
 	line := fmt.Sprintf("[%s] %3s - %6s - %s", time.Now().Format("15:04:05"), status, formatSizeShort(res.ResponseSize), displayPath(res.URL))
+	if len(res.Fingerprints) > 0 {
+		line += fmt.Sprintf(" | fp:%s", formatFingerprintNames(res))
+	}
+	if res.RiskLevel != "" {
+		line += fmt.Sprintf(" | risk:%s", res.RiskLevel)
+	}
+	if res.RiskScore > 0 {
+		line += fmt.Sprintf(" | score:%d", res.RiskScore)
+	}
+	if len(res.MethodProbes) > 0 {
+		line += fmt.Sprintf(" | probes:%s", formatMethodProbes(res))
+	}
+	if res.Title != "" {
+		line += fmt.Sprintf(" | title:%s", truncateMiddle(res.Title, 48))
+	}
 	switch res.StatusCode {
 	case 200:
 		green.Println(line)
@@ -245,4 +260,38 @@ func formatSizeShort(size int) string {
 	}
 	mb := kb / 1024.0
 	return fmt.Sprintf("%.1fMB", mb)
+}
+
+func formatFingerprintNames(res Result) string {
+	if len(res.Fingerprints) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(res.Fingerprints))
+	seen := make(map[string]struct{}, len(res.Fingerprints))
+	for _, fp := range res.Fingerprints {
+		if fp.Name == "" {
+			continue
+		}
+		if _, ok := seen[fp.Name]; ok {
+			continue
+		}
+		seen[fp.Name] = struct{}{}
+		names = append(names, fp.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+func formatMethodProbes(res Result) string {
+	if len(res.MethodProbes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(res.MethodProbes))
+	for _, probe := range res.MethodProbes {
+		if probe.Error != "" {
+			parts = append(parts, fmt.Sprintf("%s=ERR", probe.Method))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", probe.Method, probe.StatusCode))
+	}
+	return strings.Join(parts, ",")
 }

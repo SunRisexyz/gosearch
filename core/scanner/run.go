@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -17,18 +18,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gosearch/core/fingerprint"
 	"gosearch/core/output"
+	"gosearch/core/risk"
 	"gosearch/core/utils"
 
 	"golang.org/x/sync/errgroup"
 )
 
 type task struct {
-	url     string
-	isDir   bool
-	baseURL string
-	depth   int
-	seq     uint64
+	url       string
+	isDir     bool
+	baseURL   string
+	depth     int
+	seq       uint64
+	generated bool
 }
 
 type taskScheduler struct {
@@ -38,10 +42,13 @@ type taskScheduler struct {
 	ch         chan<- task
 	visited    map[string]struct{}
 	visitedMu  *sync.Mutex
+	queued     map[string]struct{}
+	queuedMu   *sync.Mutex
 	seqCounter *uint64
 	total      *uint64
 	scanned    *uint64
 	resume     *resumeStore
+	discovered map[string][]string
 }
 
 func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
@@ -77,6 +84,22 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 	if err != nil {
 		return nil, Stats{}, err
 	}
+	throttle := newAdaptiveThrottle(opts)
+	var fingerprintEngine *fingerprint.Engine
+	if opts.AdaptiveWordlist {
+		opts.Fingerprint = true
+	}
+	if opts.Fingerprint {
+		rules := fingerprint.BuiltinRules()
+		if opts.FingerprintRulesPath != "" {
+			customRules, err := fingerprint.LoadRules(opts.FingerprintRulesPath)
+			if err != nil {
+				return nil, Stats{}, err
+			}
+			rules = append(rules, customRules...)
+		}
+		fingerprintEngine = fingerprint.NewEngine(rules)
+	}
 	var directClient *http.Client
 	if (opts.Proxy != "" || opts.Socks5 != "") && !opts.NoProxyFallback {
 		directOpts := opts
@@ -89,7 +112,31 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 		}
 	}
 
+	ctx := context.Background()
+	var soft404 *soft404Baseline
+	if opts.Soft404 {
+		baselineOpts := opts
+		baselineOpts.ExcludeContent = nil
+		soft404 = buildSoft404Baseline(ctx, bases, client, directClient, baselineOpts)
+		if opts.Debug {
+			output.PrintDebug("SOFT404", fmt.Sprintf("baseline targets=%d", len(soft404.entries)))
+		}
+	}
+
 	paths := buildPaths(opts.Words, opts.Extensions, opts.FuzzEnabled, opts.FuzzWords)
+	discovered := map[string][]string{}
+	if opts.Discover {
+		discoverOpts := opts
+		discoverOpts.Body = nil
+		discovered = discoverPaths(ctx, bases, client, directClient, discoverOpts)
+		if opts.Debug {
+			count := 0
+			for _, paths := range discovered {
+				count += len(paths)
+			}
+			output.PrintDebug("DISCOVER", fmt.Sprintf("imported paths=%d", count))
+		}
+	}
 
 	workCh := make(chan task, queueBufferSize(opts.Threads))
 	var taskWG sync.WaitGroup
@@ -130,6 +177,8 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 
 	visited := make(map[string]struct{})
 	var visitedMu sync.Mutex
+	queued := make(map[string]struct{})
+	var queuedMu sync.Mutex
 	scheduler := &taskScheduler{
 		paths:      paths,
 		opts:       opts,
@@ -137,13 +186,15 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 		ch:         workCh,
 		visited:    visited,
 		visitedMu:  &visitedMu,
+		queued:     queued,
+		queuedMu:   &queuedMu,
 		seqCounter: &seqCounter,
 		total:      &total,
 		scanned:    &scanned,
 		resume:     resume,
+		discovered: discovered,
 	}
 
-	ctx := context.Background()
 	group, ctx := errgroup.WithContext(ctx)
 
 	currentPath := &atomic.Value{}
@@ -157,7 +208,7 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 
 					atomic.AddUint64(&scanned, 1)
 					currentPath.Store(t.url)
-					res, ok := doRequest(ctx, client, directClient, t.url, opts)
+					res, ok := doRequest(ctx, client, directClient, t.url, opts, fingerprintEngine, throttle)
 					var displayed *output.Result
 					if !ok || isExcluded(res, opts) {
 						if resume != nil {
@@ -165,11 +216,32 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 						}
 						return
 					}
+					if soft404 != nil && soft404.matches(t.baseURL, res, opts) {
+						if opts.Debug {
+							output.PrintDebug("SOFT404", fmt.Sprintf("filtered %s", t.url))
+						}
+						if resume != nil {
+							resume.recordDone(t, nil)
+						}
+						return
+					}
+					if opts.RiskScore {
+						risk.Apply(&res)
+						if opts.MinRisk != "" && !risk.MeetsMin(res.RiskLevel, fingerprint.RiskLevel(opts.MinRisk)) {
+							if resume != nil {
+								resume.recordDone(t, nil)
+							}
+							return
+						}
+					}
 					if !shouldDisplay(statusSizeMu, statusSizeFirst, res.Host, res.StatusCode, res.ResponseSize, t.seq) {
 						if resume != nil {
 							resume.recordDone(t, nil)
 						}
 						return
+					}
+					if len(opts.ProbeMethods) > 0 {
+						res.MethodProbes = runMethodProbes(ctx, client, directClient, t.url, opts, throttle)
 					}
 					resultsMu.Lock()
 					results = append(results, res)
@@ -181,6 +253,20 @@ func Run(targets []string, opts Options) ([]output.Result, Stats, error) {
 					}
 					if opts.Recursive && t.isDir && t.depth < opts.MaxDepth {
 						scheduler.enqueueBaseAsync(t.url, t.depth+1)
+					}
+					if opts.AdaptiveWordlist && len(res.Fingerprints) > 0 {
+						adaptivePaths := fingerprint.AdaptivePaths(res.Fingerprints)
+						if opts.Debug && len(adaptivePaths) > 0 {
+							output.PrintDebug("ADAPTIVE", fmt.Sprintf("%s -> %s", t.url, strings.Join(adaptivePaths, ",")))
+						}
+						scheduler.enqueuePathsAsync(t.baseURL, adaptivePaths, t.depth)
+					}
+					if opts.BackupVariants && !t.generated {
+						variants := backupVariants(t.url, opts.BackupVariantMax)
+						if opts.Debug && len(variants) > 0 {
+							output.PrintDebug("BACKUP", fmt.Sprintf("%s -> %s", t.url, strings.Join(variants, ",")))
+						}
+						scheduler.enqueueBackupVariantsAsync(t.baseURL, variants, t.depth)
 					}
 					if resume != nil {
 						resume.recordDone(t, displayed)
@@ -243,6 +329,28 @@ func (s *taskScheduler) enqueueBaseAsync(base string, depth int) {
 	}()
 }
 
+func (s *taskScheduler) enqueuePathsAsync(base string, paths []string, depth int) {
+	if len(paths) == 0 {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.enqueuePaths(base, paths, depth)
+	}()
+}
+
+func (s *taskScheduler) enqueueBackupVariantsAsync(base string, paths []string, depth int) {
+	if len(paths) == 0 {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.enqueuePathsWithMode(base, paths, depth, false, true)
+	}()
+}
+
 func (s *taskScheduler) enqueueBase(base string, depth int) {
 	s.visitedMu.Lock()
 	if _, ok := s.visited[base]; ok {
@@ -252,12 +360,30 @@ func (s *taskScheduler) enqueueBase(base string, depth int) {
 	s.visited[base] = struct{}{}
 	s.visitedMu.Unlock()
 
-	tasks := make([]task, 0, len(s.paths))
-	for _, p := range s.paths {
-		isDir := !strings.Contains(p, ".") && !strings.HasSuffix(p, "/")
+	s.enqueuePaths(base, s.paths, depth)
+	if depth == 1 && len(s.discovered[base]) > 0 {
+		s.enqueueExactPaths(base, s.discovered[base], depth)
+	}
+}
+
+func (s *taskScheduler) enqueuePaths(base string, paths []string, depth int) {
+	s.enqueuePathsWithMode(base, paths, depth, true, false)
+}
+
+func (s *taskScheduler) enqueueExactPaths(base string, paths []string, depth int) {
+	s.enqueuePathsWithMode(base, paths, depth, false, false)
+}
+
+func (s *taskScheduler) enqueuePathsWithMode(base string, paths []string, depth int, appendDirSlash bool, generated bool) {
+	tasks := make([]task, 0, len(paths))
+	for _, p := range paths {
+		isDir := appendDirSlash && !strings.Contains(p, ".") && !strings.HasSuffix(p, "/")
 		pathURL := joinURL(base, p, isDir)
+		if !s.markQueued(pathURL) {
+			continue
+		}
 		seq := atomic.AddUint64(s.seqCounter, 1)
-		t := task{url: pathURL, isDir: isDir, baseURL: base, depth: depth, seq: seq}
+		t := task{url: pathURL, isDir: isDir, baseURL: base, depth: depth, seq: seq, generated: generated}
 		atomic.AddUint64(s.total, 1)
 		if s.resume != nil {
 			if info, ok := s.resume.completedInfo(t.url); ok {
@@ -277,6 +403,16 @@ func (s *taskScheduler) enqueueBase(base string, depth int) {
 	for _, t := range tasks {
 		s.ch <- t
 	}
+}
+
+func (s *taskScheduler) markQueued(rawURL string) bool {
+	s.queuedMu.Lock()
+	defer s.queuedMu.Unlock()
+	if _, ok := s.queued[rawURL]; ok {
+		return false
+	}
+	s.queued[rawURL] = struct{}{}
+	return true
 }
 
 func shouldDisplay(mu *sync.Mutex, seen map[string]map[int]map[int]uint64, host string, status int, size int, seq uint64) bool {
@@ -300,12 +436,19 @@ func shouldDisplay(mu *sync.Mutex, seen map[string]map[int]map[int]uint64, host 
 	return true
 }
 
-func doRequest(ctx context.Context, client *http.Client, directClient *http.Client, target string, opts Options) (output.Result, bool) {
+func doRequest(ctx context.Context, client *http.Client, directClient *http.Client, target string, opts Options, fingerprintEngine *fingerprint.Engine, throttle *adaptiveThrottle) (output.Result, bool) {
 	retries := opts.Retry
 	if retries < 0 {
 		retries = 0
 	}
 	for attempt := 0; attempt <= retries; attempt++ {
+		if throttle != nil {
+			delay := throttle.currentDelay()
+			if opts.Debug && delay > 0 {
+				output.PrintDebug("THROTTLE", fmt.Sprintf("sleep %s before %s", delay, target))
+			}
+			throttle.wait()
+		}
 		if opts.RandomDelay {
 			delay := rand.Intn(151) + 50
 			time.Sleep(time.Duration(delay) * time.Millisecond)
@@ -336,6 +479,9 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 			if opts.Debug {
 				output.PrintDebug("ERROR", fmt.Sprintf("%s %s: %v", opts.Method, target, err))
 			}
+			if throttle != nil {
+				throttle.recordFailure()
+			}
 			if attempt < retries {
 				continue
 			}
@@ -344,6 +490,14 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 
 		bodyBytes, responseSize := readBody(resp, opts.MaxBodyBytes)
 		resp.Body.Close()
+		if throttle != nil {
+			before := throttle.currentDelay()
+			throttle.recordStatus(resp.StatusCode)
+			after := throttle.currentDelay()
+			if opts.Debug && before != after {
+				output.PrintDebug("THROTTLE", fmt.Sprintf("status=%d delay=%s", resp.StatusCode, after))
+			}
+		}
 
 		redirectURL := ""
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -357,11 +511,27 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 		res := output.Result{
 			URL:            target,
 			Host:           host,
+			Method:         opts.Method,
 			StatusCode:     resp.StatusCode,
 			ResponseSize:   responseSize,
 			RedirectURL:    redirectURL,
 			ScanTime:       time.Now(),
 			ResponseTimeMs: int(time.Since(start).Milliseconds()),
+		}
+		if shouldExtractTitle(opts, fingerprintEngine) {
+			res.Title = fingerprint.ExtractTitle(bodyBytes)
+		}
+		if fingerprintEngine != nil {
+			faviconHash := ""
+			if fingerprint.IsFaviconPath(target) {
+				faviconHash = fingerprint.FaviconHash(bodyBytes)
+			}
+			obs := fingerprint.BuildObservation(target, resp.Header, res.Title, bodyBytes, faviconHash)
+			res.Fingerprints = fingerprintEngine.Match(obs)
+			if len(res.Fingerprints) > 0 {
+				res.RiskLevel = fingerprint.HighestRisk(res.Fingerprints)
+				res.Tags = fingerprint.Tags(res.Fingerprints)
+			}
 		}
 
 		if opts.Debug {
@@ -378,7 +548,11 @@ func doRequest(ctx context.Context, client *http.Client, directClient *http.Clie
 }
 
 func newScanRequest(ctx context.Context, target string, opts Options) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, opts.Method, target, nil)
+	var body io.Reader
+	if len(opts.Body) > 0 {
+		body = bytes.NewReader(opts.Body)
+	}
+	req, err := http.NewRequestWithContext(ctx, opts.Method, target, body)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +561,30 @@ func newScanRequest(ctx context.Context, target string, opts Options) (*http.Req
 		ua = utils.RandomUserAgent()
 	}
 	req.Header.Set("User-Agent", ua)
+	applyRequestHeaders(req, opts)
 	return req, nil
+}
+
+func applyRequestHeaders(req *http.Request, opts Options) {
+	for key, values := range opts.Headers {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if strings.EqualFold(canonicalKey, "Content-Length") {
+			continue
+		}
+		if strings.EqualFold(canonicalKey, "Host") {
+			if len(values) > 0 {
+				req.Host = values[len(values)-1]
+			}
+			continue
+		}
+		req.Header.Del(canonicalKey)
+		for _, value := range values {
+			req.Header.Add(canonicalKey, value)
+		}
+	}
+	if opts.Cookie != "" {
+		req.Header.Set("Cookie", opts.Cookie)
+	}
 }
 
 func readBody(resp *http.Response, maxBytes int) ([]byte, int) {

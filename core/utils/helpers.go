@@ -41,6 +41,43 @@ func IntsToCSV(values []int) string {
 	return strings.Join(parts, ",")
 }
 
+func ParseHTTPMethods(raw string, primary string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	primary = strings.ToUpper(strings.TrimSpace(primary))
+	seen := make(map[string]struct{})
+	methods := make([]string, 0)
+	for _, part := range strings.Split(raw, ",") {
+		method := strings.ToUpper(strings.TrimSpace(part))
+		if method == "" || method == primary {
+			continue
+		}
+		if !isHTTPToken(method) {
+			return nil, errors.New("invalid HTTP method: " + method)
+		}
+		if _, ok := seen[method]; ok {
+			continue
+		}
+		seen[method] = struct{}{}
+		methods = append(methods, method)
+	}
+	return methods, nil
+}
+
+func isHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func EnsureDirs(reportDir string, dictDir string) error {
 	if reportDir != "" {
 		if err := os.MkdirAll(filepath.Clean(reportDir), 0o755); err != nil {
